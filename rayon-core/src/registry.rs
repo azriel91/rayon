@@ -1,5 +1,5 @@
 use ::{ExitHandler, PanicHandler, StartHandler, ThreadPoolBuilder, ThreadPoolBuildError, ErrorKind};
-use crossbeam_deque::{Deque, Steal, Stealer};
+use crossbeam_deque::{self as deque, Worker, Pop, Steal, Stealer};
 use job::{JobRef, StackJob};
 #[cfg(rayon_unstable)]
 use job::Job;
@@ -46,7 +46,7 @@ pub struct Registry {
 }
 
 struct RegistryState {
-    job_injector: Deque<JobRef>,
+    job_injector: Worker<JobRef>,
 }
 
 /// ////////////////////////////////////////////////////////////////////////
@@ -100,16 +100,21 @@ impl Registry {
         let n_threads = builder.get_num_threads();
         let breadth_first = builder.get_breadth_first();
 
-        let inj_worker = Deque::new();
-        let inj_stealer = inj_worker.stealer();
-        let workers: Vec<_> = (0..n_threads)
-            .map(|_| Deque::new())
-            .collect();
-        let stealers: Vec<_> = workers.iter().map(|d| d.stealer()).collect();
+        let (inj_worker, inj_stealer) = deque::fifo();
+        let (workers, stealers) = (0..n_threads)
+            .fold(
+                (Vec::with_capacity(n_threads), Vec::with_capacity(n_threads)),
+                |(mut workers, mut stealers), _| {
+                    let (worker, stealer) = deque::fifo();
+                    workers.push(worker);
+                    stealers.push(stealer);
+
+                    (workers, stealers)
+                });
 
         let registry = Arc::new(Registry {
-            thread_infos: stealers.into_iter()
-                .map(|s| ThreadInfo::new(s))
+            thread_infos: stealers.iter()
+                .map(|s| ThreadInfo::new(s.clone()))
                 .collect(),
             state: Mutex::new(RegistryState::new(inj_worker)),
             sleep: Sleep::new(),
@@ -123,7 +128,7 @@ impl Registry {
         // If we return early or panic, make sure to terminate existing threads.
         let t1000 = Terminator(&registry);
 
-        for (index, worker) in workers.into_iter().enumerate() {
+        for (index, (worker, stealer)) in workers.into_iter().zip(stealers.into_iter()).enumerate() {
             let registry = registry.clone();
             let mut b = thread::Builder::new();
             if let Some(name) = builder.get_thread_name(index) {
@@ -132,7 +137,7 @@ impl Registry {
             if let Some(stack_size) = builder.get_stack_size() {
                 b = b.stack_size(stack_size);
             }
-            if let Err(e) = b.spawn(move || unsafe { main_loop(worker, registry, index, breadth_first) }) {
+            if let Err(e) = b.spawn(move || unsafe { main_loop(worker, stealer, registry, index, breadth_first) }) {
                 return Err(ThreadPoolBuildError::new(ErrorKind::IOError(e)))
             }
         }
@@ -417,7 +422,7 @@ pub struct RegistryId {
 }
 
 impl RegistryState {
-    pub fn new(job_injector: Deque<JobRef>) -> RegistryState {
+    pub fn new(job_injector: Worker<JobRef>) -> RegistryState {
         RegistryState {
             job_injector: job_injector,
         }
@@ -453,7 +458,10 @@ impl ThreadInfo {
 
 pub struct WorkerThread {
     /// the "worker" half of our local deque
-    worker: Deque<JobRef>,
+    worker: Worker<JobRef>,
+
+    /// a stealer to allow us to take jobs from the bottom of our deque
+    stealer: Stealer<JobRef>,
 
     index: usize,
 
@@ -513,7 +521,7 @@ impl WorkerThread {
 
     #[inline]
     pub fn local_deque_is_empty(&self) -> bool {
-        self.worker.len() == 0
+        self.worker.is_empty()
     }
 
     /// Attempts to obtain a "local" job -- typically this means
@@ -523,10 +531,16 @@ impl WorkerThread {
     #[inline]
     pub unsafe fn take_local_job(&self) -> Option<JobRef> {
         if !self.breadth_first {
-            self.worker.pop()
+            loop {
+                match self.worker.pop() {
+                    Pop::Empty => return None,
+                    Pop::Data(d) => return Some(d),
+                    Pop::Retry => {},
+                }
+            }
         } else {
             loop {
-                match self.worker.steal() {
+                match self.stealer.steal() {
                     Steal::Empty => return None,
                     Steal::Data(d) => return Some(d),
                     Steal::Retry => {},
@@ -596,7 +610,14 @@ impl WorkerThread {
     /// local work to do.
     unsafe fn steal(&self) -> Option<JobRef> {
         // we only steal when we don't have any work to do locally
-        debug_assert!(self.worker.pop().is_none());
+        let has_work = loop {
+            match self.worker.pop() {
+                Pop::Empty => break false,
+                Pop::Data(_) => break true,
+                Pop::Retry => {},
+            }
+        };
+        debug_assert!(!has_work);
 
         // otherwise, try to steal
         let num_threads = self.registry.thread_infos.len();
@@ -630,12 +651,14 @@ impl WorkerThread {
 
 /// ////////////////////////////////////////////////////////////////////////
 
-unsafe fn main_loop(worker: Deque<JobRef>,
+unsafe fn main_loop(worker: Worker<JobRef>,
+                    stealer: Stealer<JobRef>,
                     registry: Arc<Registry>,
                     index: usize,
                     breadth_first: bool) {
     let worker_thread = WorkerThread {
         worker: worker,
+        stealer: stealer,
         breadth_first: breadth_first,
         index: index,
         rng: XorShift64Star::new(),
